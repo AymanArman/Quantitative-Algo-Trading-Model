@@ -24,6 +24,7 @@ library(tidyquant)
 # Section 1 — Data
 
 ```{r}
+#| cache: true
 
 # Pull daily OHLCV for all sector ETFs, SPY (benchmark), and XLG (performance tracker)
 # Training: 2000-06-01 – 2024-12-31 | Test: 2025-01-01 – 2026-03-31
@@ -34,60 +35,6 @@ df <- tidyquant::tq_get(
   from = "2000-06-01",
   to   = "2026-03-31"
 )
-
-```
-
-## Data Coverage
-
-```{r}
-
-# Confirm date range and observation count per ticker
-df %>%
-  group_by(symbol) %>%
-  summarise(
-    first_date = min(date),
-    last_date  = max(date),
-    n_obs      = n(),
-    .groups    = "drop"
-  ) %>%
-  arrange(first_date)
-
-```
-
-## Data Quality — NA / NaN / NULL
-
-```{r}
-
-# NA count per column per symbol
-# NaN in R is a special case of NA for numeric columns — is.na() catches both
-na_summary <- df %>%
-  group_by(symbol) %>%
-  summarise(across(everything(), ~sum(is.na(.))), .groups = "drop")
-
-na_summary
-
-```
-
-```{r}
-
-# Flag any rows where price columns are zero or negative — indicates data corruption
-df %>%
-  filter(open <= 0 | high <= 0 | low <= 0 | close <= 0 | adjusted <= 0) %>%
-  nrow() %>%
-  {cat("Rows with zero or negative prices:", ., "\n")}
-
-```
-
-```{r}
-
-# Check for missing trading dates: any date where some symbols have data but others don't
-# A clean dataset should have the same set of dates for all symbols active at that point
-date_coverage <- df %>%
-  group_by(date) %>%
-  summarise(n_symbols = n_distinct(symbol), .groups = "drop")
-
-cat("Expected symbols per date (full universe):", n_distinct(df$symbol), "\n")
-cat("Dates with fewer symbols than expected:", sum(date_coverage$n_symbols < n_distinct(df$symbol)), "\n")
 
 ```
 
@@ -104,9 +51,6 @@ cat("Dates with fewer symbols than expected:", sum(date_coverage$n_symbols < n_d
 #   oo_return: open-to-open (adjusted)
 #   co_return: overnight gap — today's adj open vs yesterday's adj close
 #   oc_return: intraday — today's adj close vs today's adj open
-#
-# Execution convention for portfolio simulation (Section 6) is tentative — determined by
-# execution logic. Arithmetic returns will be derived from whichever convention is chosen.
 df <- df %>%
   group_by(symbol) %>%
   arrange(date) %>%
@@ -121,46 +65,160 @@ df <- df %>%
 
 ```
 
+## Data Summary
+
 ```{r}
 
-# Sanity check — quantiles across all return conventions to catch data corruption or outliers
-df %>%
+library(gt)
+
+# Compute all diagnostic stats in one place
+date_coverage <- df %>%
+  group_by(date) %>%
+  summarise(n_symbols = n_distinct(symbol), .groups = "drop")
+
+n_universe      <- n_distinct(df$symbol)
+n_dates_partial <- sum(date_coverage$n_symbols < n_universe)
+n_nulls         <- sum(is.na(df %>% select(open, high, low, close, adjusted)))
+n_bad_prices    <- df %>% filter(open <= 0 | high <= 0 | low <= 0 | close <= 0 | adjusted <= 0) %>% nrow()
+
+return_quantiles <- df %>%
   filter(!is.na(cc_return)) %>%
   select(symbol, cc_return, oo_return, co_return, oc_return) %>%
-  pivot_longer(-symbol, names_to = "convention", values_to = "return") %>%
-  group_by(convention) %>%
+  pivot_longer(-symbol, names_to = "Convention", values_to = "return") %>%
+  group_by(Convention) %>%
   summarise(
-    min    = round(min(return,                 na.rm = TRUE), 4),
-    q01    = round(quantile(return, 0.01,      na.rm = TRUE), 4),
-    median = round(median(return,              na.rm = TRUE), 4),
-    q99    = round(quantile(return, 0.99,      na.rm = TRUE), 4),
-    max    = round(max(return,                 na.rm = TRUE), 4),
+    Min    = round(min(return,            na.rm = TRUE), 4),
+    `1%`   = round(quantile(return, 0.01, na.rm = TRUE), 4),
+    Median = round(median(return,         na.rm = TRUE), 4),
+    `99%`  = round(quantile(return, 0.99, na.rm = TRUE), 4),
+    Max    = round(max(return,            na.rm = TRUE), 4),
     .groups = "drop"
+  )
+
+# Key-value summary card
+tibble(
+  Check  = c(
+    "Date range",
+    "Symbols",
+    "Total rows",
+    "NAs in price columns",
+    "Rows with zero or negative prices",
+    "Dates with full universe (13 symbols)",
+    "Dates with partial universe"
+  ),
+  Result = c(
+    paste(format(min(df$date), "%b %Y"), "–", format(max(df$date), "%b %Y")),
+    paste(sort(unique(df$symbol)), collapse = ", "),
+    format(nrow(df), big.mark = ","),
+    as.character(n_nulls),
+    as.character(n_bad_prices),
+    format(sum(date_coverage$n_symbols == n_universe), big.mark = ","),
+    format(n_dates_partial, big.mark = ",")
+  )
+) %>%
+  gt() %>%
+  cols_label(Check = "", Result = "") %>%
+  tab_style(
+    style     = list(cell_text(weight = "bold", color = "#1B2A4A")),
+    locations = cells_body(columns = Check)
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#F5F7FA"),
+    locations = cells_body(rows = c(1, 3, 5, 7))
+  ) %>%
+  tab_options(
+    column_labels.hidden        = TRUE,
+    table.border.top.color      = "#1B2A4A",
+    table.border.bottom.color   = "#1B2A4A",
+    table.font.size             = 14,
+    data_row.padding            = px(6)
+  )
+
+```
+
+```{r}
+
+# Return quantile sanity check — confirms no data corruption or extreme outliers
+return_quantiles %>%
+  gt() %>%
+  tab_header(
+    title    = "Return Distribution by Convention",
+    subtitle = "Log returns — all symbols, full history"
+  ) %>%
+  tab_style(
+    style     = list(cell_fill(color = "#1B2A4A"), cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#F5F7FA"),
+    locations = cells_body(rows = c(1, 3))
+  ) %>%
+  tab_style(
+    style     = cell_text(color = "#1B2A4A", weight = "bold", size = "large"),
+    locations = cells_title(groups = "title")
+  ) %>%
+  tab_style(
+    style     = cell_text(color = "#4A6FA5", size = "small"),
+    locations = cells_title(groups = "subtitle")
+  ) %>%
+  tab_options(
+    table.border.top.color            = "#1B2A4A",
+    table.border.bottom.color         = "#1B2A4A",
+    column_labels.border.bottom.color = "#1B2A4A",
+    table.font.size                   = 14,
+    data_row.padding                  = px(6)
   )
 
 ```
 
 ## Price History
 
-```{r, fig.width = 10, fig.height = 6}
+```{r}
+
+library(plotly)
 
 # Adjusted closing price over full history — confirms data loaded correctly
-# SPY and XLG shown separately as benchmarks
-df %>%
-  mutate(role = case_when(
-    symbol %in% c("SPY", "XLG") ~ "Benchmark",
-    TRUE                        ~ "Sector ETF"
-  )) %>%
-  ggplot(aes(x = date, y = adjusted, colour = symbol)) +
-  geom_line(linewidth = 0.4) +
-  facet_wrap(~role, scales = "free_y") +
-  labs(
-    title  = "Adjusted Closing Prices — Full History",
-    x      = NULL,
-    y      = "Adjusted Close ($)",
-    colour = NULL
-  ) +
-  theme_minimal()
+# SPY and XLG shown separately as benchmarks; free y-scales per panel
+df_bench  <- df %>% filter(symbol %in% c("SPY", "XLG"))
+df_sector <- df %>% filter(!symbol %in% c("SPY", "XLG"))
+
+# Build benchmark panel
+p_bench <- plot_ly()
+for (sym in unique(df_bench$symbol)) {
+  d <- filter(df_bench, symbol == sym)
+  p_bench <- add_lines(p_bench, x = d$date, y = d$adjusted, name = sym)
+}
+p_bench <- layout(p_bench,
+  xaxis = list(title = ""),
+  yaxis = list(title = "Adjusted Close ($)"),
+  annotations = list(list(
+    text = "Benchmark", x = 0.25, y = 1.05,
+    xref = "paper", yref = "paper", showarrow = FALSE,
+    font = list(size = 13, color = "#1B2A4A")
+  ))
+)
+
+# Build sector ETF panel
+p_sector <- plot_ly()
+for (sym in sort(unique(df_sector$symbol))) {
+  d <- filter(df_sector, symbol == sym)
+  p_sector <- add_lines(p_sector, x = d$date, y = d$adjusted, name = sym)
+}
+p_sector <- layout(p_sector,
+  xaxis = list(title = ""),
+  yaxis = list(title = ""),
+  annotations = list(list(
+    text = "Sector ETFs", x = 0.75, y = 1.05,
+    xref = "paper", yref = "paper", showarrow = FALSE,
+    font = list(size = 13, color = "#1B2A4A")
+  ))
+)
+
+subplot(p_bench, p_sector, nrows = 1, shareX = FALSE, titleX = TRUE, widths = c(0.35, 0.65)) %>%
+  layout(
+    title     = list(text = "Adjusted Closing Prices — Full History", font = list(size = 15)),
+    hovermode = "x unified"
+  )
 
 ```
 
@@ -198,12 +256,6 @@ test_df  <- algo_df %>% filter(date >= as.Date("2025-01-01") & date <= as.Date("
 ```
 
 # Section 3 — Lookback Period Selection
-
-```{r, message = FALSE}
-
-library(gt)
-
-```
 
 ```{r}
 
@@ -264,6 +316,7 @@ compute_lookback_cor <- function(sym, L, H, data) {
 ```
 
 ```{r}
+#| cache: true
 
 # Run across all symbols x all L candidates — one row per ETF x L in output
 symbols_universe <- unique(train_df$symbol)
@@ -369,61 +422,6 @@ lookback_summary %>%
 
 ```
 
-```{r}
-
-# Detail table — one row per ETF x L, ordered by L then symbol
-# Significant rows (p < 0.05) highlighted in slate-blue
-# Fixed height showing ~6-7 rows; remainder scrollable
-lookback_results %>%
-  arrange(L, symbol) %>%
-  mutate(significant = p_value < 0.05) %>%
-  gt() %>%
-  tab_header(
-    title    = "Lookback Correlation — Full Detail",
-    subtitle = "One row per ETF × lookback candidate | Training data only"
-  ) %>%
-  cols_label(
-    symbol      = "ETF",
-    L           = "Lookback (days)",
-    H           = "Holding (days)",
-    n_obs       = "Samples",
-    r           = "r",
-    r_sq        = "r²",
-    p_value     = "p-value",
-    significant = "p < 0.05"
-  ) %>%
-  fmt_number(columns = c(r, r_sq, p_value), decimals = 3) %>%
-  cols_hide(significant) %>%
-  # Navy header
-  tab_style(
-    style     = list(cell_fill(color = col_navy), cell_text(color = "white", weight = "bold")),
-    locations = cells_column_labels()
-  ) %>%
-  # Highlight significant rows
-  tab_style(
-    style     = cell_fill(color = col_light_slate),
-    locations = cells_body(rows = significant == TRUE)
-  ) %>%
-  # Title styling
-  tab_style(
-    style     = cell_text(color = col_navy, weight = "bold", size = "large"),
-    locations = cells_title(groups = "title")
-  ) %>%
-  tab_style(
-    style     = cell_text(color = col_slate, size = "small"),
-    locations = cells_title(groups = "subtitle")
-  ) %>%
-  tab_options(
-    table.border.top.color            = col_navy,
-    table.border.bottom.color         = col_navy,
-    column_labels.border.bottom.color = col_navy,
-    table.font.size                   = 14,
-    data_row.padding                  = px(6),
-    container.height                  = px(220),
-    container.overflow.y              = "auto"
-  )
-
-```
 
 ```{r}
 
@@ -476,6 +474,7 @@ compute_rel_cor <- function(sym, L, H, data, spy_ret) {
 ```
 
 ```{r}
+#| cache: true
 
 # Run across all symbols except SPY (XLG included as diagnostic)
 symbols_rel <- symbols_universe[symbols_universe != "SPY"]
@@ -573,57 +572,6 @@ lookback_summary_rel %>%
 
 ```
 
-```{r}
-
-# Detail table — relative return, one row per ETF x L, ordered by L then symbol
-# Fixed height showing ~6-7 rows; remainder scrollable
-lookback_results_rel %>%
-  arrange(L, symbol) %>%
-  mutate(significant = p_value < 0.05) %>%
-  gt() %>%
-  tab_header(
-    title    = "Lookback Correlation (Relative) — Full Detail",
-    subtitle = "One row per ETF × lookback candidate | Excess return vs SPY | Training data only"
-  ) %>%
-  cols_label(
-    symbol      = "ETF",
-    L           = "Lookback (days)",
-    H           = "Holding (days)",
-    n_obs       = "Samples",
-    r           = "r",
-    r_sq        = "r²",
-    p_value     = "p-value",
-    significant = "p < 0.05"
-  ) %>%
-  fmt_number(columns = c(r, r_sq, p_value), decimals = 3) %>%
-  cols_hide(significant) %>%
-  tab_style(
-    style     = list(cell_fill(color = col_navy), cell_text(color = "white", weight = "bold")),
-    locations = cells_column_labels()
-  ) %>%
-  tab_style(
-    style     = cell_fill(color = col_light_slate),
-    locations = cells_body(rows = significant == TRUE)
-  ) %>%
-  tab_style(
-    style     = cell_text(color = col_navy, weight = "bold", size = "large"),
-    locations = cells_title(groups = "title")
-  ) %>%
-  tab_style(
-    style     = cell_text(color = col_slate, size = "small"),
-    locations = cells_title(groups = "subtitle")
-  ) %>%
-  tab_options(
-    table.border.top.color            = col_navy,
-    table.border.bottom.color         = col_navy,
-    column_labels.border.bottom.color = col_navy,
-    table.font.size                   = 14,
-    data_row.padding                  = px(6),
-    container.height                  = px(220),
-    container.overflow.y              = "auto"
-  )
-
-```
 
 # Section 4 — Feature Engineering
 
@@ -793,6 +741,7 @@ apply_kalman_pc2 <- function(pc2_df, Q = kalman_Q, R = kalman_R) {
 ```
 
 ```{r}
+#| cache: true
 
 # Apply Kalman filter and join both pc2 columns back onto algo_df
 pc2_filtered_df <- apply_kalman_pc2(pc2_raw_df)
@@ -1065,6 +1014,7 @@ K <- 4L
 ```
 
 ```{r}
+#| cache: true
 
 # Dynamic monthly clustering: re-fit k-means at each rebalancing date (train + test)
 # Returns one row per ETF per rebalancing date with cluster_id assigned
@@ -1240,10 +1190,95 @@ algo_df <- algo_df %>%
 
 # Portfolio constants
 STARTING_CAPITAL <- 1e6    # $1,000,000
-ROTATION_BUFFER  <- 0     # No rotation buffer — free monthly rotation to best cluster
 
 # Test-period rebalancing dates: first trading day of each month, Jan 2025 – Mar 2026
 rebal_dates_test <- rebal_dates_all[rebal_dates_all >= as.Date("2025-01-01")]
+
+```
+
+## Rotation Buffer Calibration
+
+To avoid setting the rotation buffer arbitrarily, we first characterise the signal noise on the training data. At each training rebalancing date, the top two clusters are ranked by their equal-weighted average `rolling_avg_return`. The spread between rank-1 and rank-2 is computed and its distribution is examined below.
+
+```{r}
+#| cache: true
+
+# compute_spread: compute rank-1 minus rank-2 cluster avg return for one rebalancing date
+# Inputs: d — rebalancing date, cluster_assign — cluster_assignments df, data — algo_df
+# Returns: tibble(date, rank1_avg, rank2_avg, spread), or NULL if fewer than 2 clusters
+compute_spread <- function(d, cluster_assign, data) {
+  clusters_now <- cluster_assign %>%
+    filter(date == d) %>%
+    select(symbol, cluster_id)
+
+  returns_now <- data %>%
+    filter(date == d, symbol %in% sector_etfs) %>%
+    select(symbol, rolling_avg_return)
+
+  joined <- clusters_now %>%
+    left_join(returns_now, by = "symbol") %>%
+    drop_na(rolling_avg_return)
+
+  cluster_avgs <- joined %>%
+    group_by(cluster_id) %>%
+    summarise(cluster_avg = mean(rolling_avg_return, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(cluster_avg))
+
+  if (nrow(cluster_avgs) < 2) return(NULL)
+
+  tibble(
+    date     = d,
+    rank1_avg = cluster_avgs$cluster_avg[1],
+    rank2_avg = cluster_avgs$cluster_avg[2],
+    spread    = cluster_avgs$cluster_avg[1] - cluster_avgs$cluster_avg[2]
+  )
+}
+
+# Compute spread across all training rebalancing dates
+spread_df <- map_dfr(rebal_dates_train, compute_spread,
+                     cluster_assign = cluster_assignments,
+                     data           = algo_df)
+
+spread_sd <- sd(spread_df$spread)
+
+# Rotation buffer: 2 standard deviations of the training-period rank-1 vs rank-2 spread
+# Only rotate when the new top cluster's lead exceeds the estimated noise floor by 2 SD
+ROTATION_BUFFER <- 2 * spread_sd
+
+```
+
+```{r}
+
+# Histogram of rank-1 vs rank-2 cluster return spreads (training period)
+# Standard deviation annotated directly on the chart
+plot_ly(
+  spread_df,
+  x    = ~spread * 100,
+  type = "histogram",
+  nbinsx = 30,
+  marker = list(color = "#4C78A8", line = list(color = "white", width = 0.5))
+) %>%
+  add_segments(
+    x     = spread_sd * 100, xend = spread_sd * 100,
+    y     = 0,               yend = 20,
+    line  = list(color = "#E45756", width = 2, dash = "dash"),
+    name  = "1 SD",
+    showlegend = FALSE
+  ) %>%
+  add_annotations(
+    x         = spread_sd * 100,
+    y         = 21,
+    text      = paste0("SD = ", round(spread_sd * 100, 3), "%"),
+    showarrow = FALSE,
+    font      = list(color = "#E45756", size = 13)
+  ) %>%
+  layout(
+    title  = list(text = "Distribution of Rank-1 vs Rank-2 Cluster Return Spread (Training)",
+                  font = list(size = 15)),
+    xaxis  = list(title = "Spread (%, daily return units)"),
+    yaxis  = list(title = "Count"),
+    bargap = 0.05
+  )
 
 ```
 
@@ -1255,7 +1290,7 @@ At each monthly rebalance date the strategy applies a three-step signal:
 
 1.  **Cluster ranking.** Clusters are ranked by their equal-weighted average `rolling_avg_return` across constituent ETFs. The top cluster is the highest-ranked. This average can be negative — the rotation buffer and weighting rule handle that downstream.
 
-2.  **Rotation buffer.** No rotation buffer is applied — the strategy rotates freely to the highest-ranked cluster at every rebalance date. Empirical testing showed that a buffer caused the strategy to remain in stale clusters during fast-moving sector rotation, significantly reducing returns. Free monthly rotation better captures the cross-sectional momentum signal.
+2.  **Rotation buffer.** The strategy only rotates to a new top cluster if it outperforms the current cluster by more than `ROTATION_BUFFER` (2 standard deviations of the rank-1 vs rank-2 spread distribution observed over the training period, approximately 0.148%). A spread below this threshold is statistically indistinguishable from noise; one above it reflects a meaningfully strong momentum divergence.
 
 3.  **ETF weighting within the top cluster.** ETFs are ranked by `rolling_avg_return`. Weight is assigned by inverse rank, normalised to sum to 1, across ETFs with strictly positive rolling average return. ETFs with non-positive returns receive zero weight. If all ETFs in the top cluster have non-positive returns the portfolio moves fully to cash for that period — a natural consequence of the weighting rule, documented here as an explicit assumption: *the strategy moves to cash when no ETF in the selected cluster shows positive momentum.*
 
@@ -1329,6 +1364,7 @@ compute_signal <- function(rebal_date, prev_cluster, cluster_assign, data, buffe
 ## Simulation
 
 ```{r}
+#| cache: true
 
 # Simulation loop: Jan 2025 – Mar 2026
 # Rebalance days: gap return on old weights (co_return), intraday on new weights (oc_return)

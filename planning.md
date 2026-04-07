@@ -207,8 +207,9 @@ Apply momentum signal logic and simulate the strategy over the test set.
 - Top cluster = highest average return (can be negative — see edge case below)
 
 **Rotation buffer:**
-- Only rotate to a new top cluster if it outperforms the current cluster by > 0.5% (tentative; noted in document)
+- Set at 2 SD of the training-period rank-1 vs rank-2 spread distribution (~0.148%); derived quantitatively
 - On first rebalance (no prior cluster): no buffer applied
+- **Design decision (surface in reflection):** When buffer blocks a rotation, the strategy stays in `prev_cluster` rather than going to cash. Alternative considered: treat sub-buffer spread as full uncertainty and exit to cash. Rejected because buffer uncertainty (competitor not convincing enough) is distinct from signal failure (current cluster gone cold). Cash is reserved for the all-negative edge case only.
 
 **ETF ranking within top cluster:**
 - Rank constituent ETFs by rolling average `cc_return` over `lookback_days`

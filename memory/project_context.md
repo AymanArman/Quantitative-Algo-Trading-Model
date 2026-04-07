@@ -77,7 +77,7 @@ Clustering-based S&P 500 sector trading model in R, submitted as .qmd + self-con
 
 **Section 7 decisions locked:**
 - Top cluster: highest equal-weighted rolling avg cc_return over 63 days (can be negative)
-- Rotation buffer: 0 (removed) — empirically tested; buffer caused strategy to stall in stale clusters, removing it beat SPY over test period
+- Rotation buffer: 2 SD of training-period rank-1 vs rank-2 spread distribution (~0.148%); derived quantitatively, not hardcoded
 - ETF weighting: inverse rank, positive-return ETFs only; renormalised to sum to 1
 - All-negative edge case: implicit cash via zero weights (Option A) — documented explicitly
 - Ties broken alphabetically by symbol

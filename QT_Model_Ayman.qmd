@@ -1,5 +1,5 @@
 ---
-title: "QT_Model_Ayman"
+title: "Quantitative Trading Model"
 format: 
   html:
     embed-resources: true
@@ -21,6 +21,33 @@ library(tidyquant)
 
 ```
 
+# Strategy Overview
+
+**Strategy:** Cross-sectional momentum-driven sector rotation using clustering, monthly rebalancing, long-only.
+
+## Decision Flow
+
+```{mermaid}
+flowchart LR
+      A([Monthly Rebalance]) --> B[Feature Engineering\n& Clustering]
+      B --> C{Rotation\nBuffer?}
+      C -- Exceeded --> D[New Top Cluster]
+      C -- Not Exceeded --> E[Hold Cluster]
+      D --> F{Positive\nReturns?}
+      E --> F
+      F -- Yes --> G[Inverse Rank\nWeighting]
+      F -- No --> H([Cash])
+      G --> I([Execute at Open])
+```
+
+## Results Summary
+
+-   Annualised Return: 11.84% vs SPY 5.80%
+
+-   Sharpe Ratio: 0.353 vs SPY 0.093
+
+-   Omega Ratio: 1.093 vs SPY 1.037
+
 # Section 1 — Data
 
 ```{r}
@@ -37,8 +64,6 @@ df <- tidyquant::tq_get(
 )
 
 ```
-
-## Return Computation
 
 ```{r}
 
@@ -65,7 +90,7 @@ df <- df %>%
 
 ```
 
-## Data Summary
+## Data Exploration & Quality
 
 ```{r}
 
@@ -214,15 +239,9 @@ p_sector <- layout(p_sector,
   ))
 )
 
-subplot(p_bench, p_sector, nrows = 1, shareX = FALSE, titleX = TRUE, widths = c(0.35, 0.65)) %>%
-  layout(
-    title     = list(text = "Adjusted Closing Prices — Full History", font = list(size = 15)),
-    hovermode = "x unified"
-  )
 
+subplot(p_bench, p_sector, nrows = 1, shareX = FALSE, titleX = TRUE, widths = c(0.35, 0.65))
 ```
-
-# Section 2 — Algo Dataset Construction
 
 ```{r}
 
@@ -245,7 +264,6 @@ algo_df <- df %>%
          close = adjusted,
          cc_return, oo_return, co_return, oc_return)
 
-glimpse(algo_df)
 
 # Split into training and test sets — defined once here, referenced throughout
 # Training: 2000-06-01 – 2024-12-31 (model fitting, PCA, clustering, feature calibration)
@@ -255,7 +273,13 @@ test_df  <- algo_df %>% filter(date >= as.Date("2025-01-01") & date <= as.Date("
 
 ```
 
-# Section 3 — Lookback Period Selection
+# Section 2 — Data Manipulation
+
+## Look-back Period Selection
+
+We establish a rolling correlation window to be used as a benchmark look-back period for the algo-model.
+
+The look-back period is calculated by calculating rolling correlation of returns in our holding period (30 days) and multiple different candidate look-back periods (30-252 days). Reference Ernest Chan [**Algorithmic trading : winning strategies and their rationale**](https://search.library.ualberta.ca/discovery/fulldisplay?docid=alma991043595408009116&context=L&vid=01UOA_INST:UOA&lang=en&search_scope=MyInst_and_CI&adaptor=Local%20Search%20Engine&tab=Everything&query=any%2Ccontains%2Cernest%20chan%20winning&facet=rtype%2Cexclude%2Creviews%2Clk) **(**pg.111) for further details.\
 
 ```{r}
 
@@ -422,7 +446,6 @@ lookback_summary %>%
 
 ```
 
-
 ```{r}
 
 # Pull SPY returns as a named vector (date → cc_return) for fast lookup
@@ -572,8 +595,19 @@ lookback_summary_rel %>%
 
 ```
 
+Despite weak results, we prioritized minimizing look-back window size and maximizing explanatory power. 63 days came out as superior - and is influenced by Jegadeesh & Titman (1993), who find that 3-12 months hold the strongest momentum signals.
 
-# Section 4 — Feature Engineering
+## Feature Engineering
+
+Features were chosen to explain multiple key characteristics of our tradeable ETF set for further clustering. Below are the features:
+
+-   **Kalman-filtered PC2 loading** — captures each ETF's cyclical vs defensive character, smoothed to remove day-to-day noise in the factor exposure. Chose PC2 because PC1 loadings would likely display ETF co-movements via overall market moves.
+
+-   **Relative strength vs SPY** — measures whether the ETF is outperforming or underperforming the broad market over the lookback window.
+
+-   **Beta to SPY** — sensitivity to broad market moves; separates high-risk cyclicals from defensive low-beta sectors.
+
+-   **Momentum consistency (hit rate)** — fraction of lookback days with positive close-close returns. Distinguishes steady trending ETFs from volatile ones with the same average return.
 
 ```{r}
 
@@ -653,52 +687,6 @@ compute_rolling_pc2 <- function(data, lookback) {
 # Run rolling PCA on full algo_df (train + test) — takes a moment
 # Cached: result saved to disk after first render, skipped on subsequent renders
 pc2_raw_df <- compute_rolling_pc2(algo_df, lookback_days)
-
-```
-
-```{r}
-
-# Snapshot verification: PC2 loadings at one representative date
-# Positive loading = cyclical, negative = defensive
-snapshot_date <- as.Date("2015-01-02")
-
-pc2_raw_df %>%
-  filter(date == snapshot_date) %>%
-  arrange(desc(pc2_raw)) %>%
-  gt() %>%
-  tab_header(
-    title    = "PC2 Loadings — Snapshot Verification",
-    subtitle = paste("Date:", snapshot_date, "| Positive = Cyclical | Negative = Defensive")
-  ) %>%
-  cols_label(
-    date    = "Date",
-    symbol  = "ETF",
-    pc2_raw = "PC2 Loading"
-  ) %>%
-  fmt_number(columns = pc2_raw, decimals = 4) %>%
-  tab_style(
-    style     = list(cell_fill(color = col_navy), cell_text(color = "white", weight = "bold")),
-    locations = cells_column_labels()
-  ) %>%
-  tab_style(
-    style     = cell_fill(color = col_light_slate),
-    locations = cells_body(rows = pc2_raw > 0)
-  ) %>%
-  tab_style(
-    style     = cell_text(color = col_navy, weight = "bold", size = "large"),
-    locations = cells_title(groups = "title")
-  ) %>%
-  tab_style(
-    style     = cell_text(color = col_slate, size = "small"),
-    locations = cells_title(groups = "subtitle")
-  ) %>%
-  tab_options(
-    table.border.top.color            = col_navy,
-    table.border.bottom.color         = col_navy,
-    column_labels.border.bottom.color = col_navy,
-    table.font.size                   = 14,
-    data_row.padding                  = px(6)
-  )
 
 ```
 
@@ -850,14 +838,6 @@ model_df <- algo_df %>%
   ) %>%
   arrange(date)
 
-glimpse(model_df)
-
-```
-
-```{r, message = FALSE}
-
-library(plotly)
-
 ```
 
 ```{r}
@@ -902,7 +882,9 @@ plot_ly(
 
 ```
 
-# Section 5 — Clustering
+The algorithm broadly categorizes ETF's as defensive vs cyclical. It tethers XLK (Tech) to a positive loading value to ensure eigen-vector signs don't flip arbitrarily - and so any ETF with positive loading value is cyclical. The key assumption is that tech is always cyclical. View defensive vs cyclical labeling via PC2 loadings over time with the chart above.
+
+# Section 3 — Clustering
 
 ```{r, message = FALSE}
 
@@ -1005,6 +987,11 @@ plot_ly(
 
 ```
 
+**K = 4** was chosen for two reasons -
+
+1.  Marginal reduction in squared error falls off reasonably so following K = 4.
+2.  Less clusters were prioritized due to the limited \# of ETF's to trade with.
+
 ```{r}
 
 # Lock K after inspecting elbow chart
@@ -1060,52 +1047,52 @@ model_df <- model_df %>%
 
 # XLK validation: cluster assignment over time
 # XLK should consistently fall in the cluster with the highest average pc2_filtered
-xlk_validation <- cluster_assignments %>%
-  filter(symbol == "XLK") %>%
-  left_join(
-    algo_df %>% select(date, symbol, pc2_filtered),
-    by = c("date", "symbol")
-  ) %>%
-  arrange(date)
-
-xlk_validation %>%
-  mutate(year = lubridate::year(date)) %>%
-  group_by(year, cluster_id) %>%
-  summarise(n_months = n(), avg_pc2 = round(mean(pc2_filtered, na.rm = TRUE), 3),
-            .groups = "drop") %>%
-  gt() %>%
-  tab_header(
-    title    = "XLK Cluster Assignment by Year",
-    subtitle = "Validates XLK consistently falls in the high pc2_filtered (cyclical) cluster"
-  ) %>%
-  cols_label(
-    year       = "Year",
-    cluster_id = "Cluster",
-    n_months   = "Months",
-    avg_pc2    = "Avg PC2 Filtered"
-  ) %>%
-  fmt_number(columns = avg_pc2, decimals = 3) %>%
-  tab_style(
-    style     = list(cell_fill(color = col_navy), cell_text(color = "white", weight = "bold")),
-    locations = cells_column_labels()
-  ) %>%
-  tab_style(
-    style     = cell_text(color = col_navy, weight = "bold", size = "large"),
-    locations = cells_title(groups = "title")
-  ) %>%
-  tab_style(
-    style     = cell_text(color = col_slate, size = "small"),
-    locations = cells_title(groups = "subtitle")
-  ) %>%
-  tab_options(
-    table.border.top.color            = col_navy,
-    table.border.bottom.color         = col_navy,
-    column_labels.border.bottom.color = col_navy,
-    table.font.size                   = 14,
-    data_row.padding                  = px(6),
-    container.height                  = px(220),
-    container.overflow.y              = "auto"
-  )
+#xlk_validation <- cluster_assignments %>%
+#  filter(symbol == "XLK") %>%
+#  left_join(
+#    algo_df %>% select(date, symbol, pc2_filtered),
+#    by = c("date", "symbol")
+#  ) %>%
+#  arrange(date)
+#
+#xlk_validation %>%
+#  mutate(year = lubridate::year(date)) %>%
+#  group_by(year, cluster_id) %>%
+#  summarise(n_months = n(), avg_pc2 = round(mean(pc2_filtered, na.rm = TRUE), 3),
+#            .groups = "drop") %>%
+#  gt() %>%
+#  tab_header(
+#    title    = "XLK Cluster Assignment by Year",
+#    subtitle = "Validates XLK consistently falls in the high pc2_filtered      (cyclical) cluster"
+#  ) %>%
+#  cols_label(
+#    year       = "Year",
+#    cluster_id = "Cluster",
+#    n_months   = "Months",
+#   avg_pc2    = "Avg PC2 Filtered"
+#  ) %>%
+#  fmt_number(columns = avg_pc2, decimals = 3) %>%
+#  tab_style(
+#    style     = list(cell_fill(color = col_navy), cell_text(color = "white", #weight = "bold")),
+#    locations = cells_column_labels()
+#  ) %>%
+#  tab_style(
+#    style     = cell_text(color = col_navy, weight = "bold", size = "large"),
+#    locations = cells_title(groups = "title")
+#  ) %>%
+#  tab_style(
+#    style     = cell_text(color = col_slate, size = "small"),
+#    locations = cells_title(groups = "subtitle")
+#  ) %>%
+#  tab_options(
+#    table.border.top.color            = col_navy,
+#    table.border.bottom.color         = col_navy,
+#    column_labels.border.bottom.color = col_navy,
+#    table.font.size                   = 14,
+#    data_row.padding                  = px(6),
+#    container.height                  = px(220),
+#    container.overflow.y              = "auto"
+#  )
 
 ```
 
@@ -1157,15 +1144,15 @@ plot_ly(
 
 ```
 
-# Section 6 — Portfolio Infrastructure
+# Section 4 — Trading Rules
 
 The portfolio is simulated over the test period (Jan 2025 – Mar 2026) with \$1,000,000 starting capital, monthly rebalancing, and long-only positions within the top momentum cluster.
 
-**Execution convention:** On each rebalance day T, P&L is split into two components. Old positions earn the overnight gap return (`co_return`: T−1 close → T open). New positions are established at the open and earn the intraday return (`oc_return`: T open → T close). Non-rebalance days apply `cc_return` on the held weights. A single `portfolio_value` column records end-of-day (close) value each day.
+**Execution convention:** Rebalance days split P&L into gap (`co_return`: prior close → open) on old weights, then intraday (`oc_return`: open → close) on new weights. All other days apply `cc_return` on held weights.
 
-**Explicit assumptions:** Full execution at the open price; zero transaction costs; zero market impact; cash positions earn 0% (no risk-free rate applied).
+**Trade assumptions:** Full execution at the open; zero transaction costs; zero market impact; cash earns 0%.
 
-**First rebalance:** The strategy deploys on the first trading day of January 2025 using the last 63 days of training data (Oct–Dec 2024) as the signal lookback. No test-period warm-up is consumed.
+**Opening position:** Strategy deploys on the first trading day of January 2025, using the final 63 days of training data as the signal lookback.
 
 ```{r}
 
@@ -1196,9 +1183,13 @@ rebal_dates_test <- rebal_dates_all[rebal_dates_all >= as.Date("2025-01-01")]
 
 ```
 
-## Rotation Buffer Calibration
+## Rotation Buffer
 
-To avoid setting the rotation buffer arbitrarily, we first characterise the signal noise on the training data. At each training rebalancing date, the top two clusters are ranked by their equal-weighted average `rolling_avg_return`. The spread between rank-1 and rank-2 is computed and its distribution is examined below.
+To avoid trading on noise, a rotation buffer was implemented to ensure the new rank 1 cluster significantly outperformed the previous rank 1 cluster over the look-back period.
+
+If the marginal return is less than the buffer, the model's conviction remains with the positions in the previous cluster (allocations subject to within cluster returns).
+
+At each training rebalancing date, the top two clusters are ranked by their equal-weighted average `rolling_avg_return`. The spread between rank-1 and rank-2 is computed and its distribution is examined below.
 
 ```{r}
 #| cache: true
@@ -1247,6 +1238,8 @@ ROTATION_BUFFER <- 2 * spread_sd
 
 ```
 
+**Rotation buffer selected = 2\*SD = \~0.14%**
+
 ```{r}
 
 # Histogram of rank-1 vs rank-2 cluster return spreads (training period)
@@ -1282,17 +1275,17 @@ plot_ly(
 
 ```
 
-# Section 7 — Signal Rules + Simulation
+# Section 5 — Simulation
 
 ## Signal Logic
 
 At each monthly rebalance date the strategy applies a three-step signal:
 
-1.  **Cluster ranking.** Clusters are ranked by their equal-weighted average `rolling_avg_return` across constituent ETFs. The top cluster is the highest-ranked. This average can be negative — the rotation buffer and weighting rule handle that downstream.
+1.  **Cluster ranking.** Clusters are ranked by their equal-weighted average `rolling_avg_return` across constituent ETFs. The top cluster is the highest-ranked. This average can be negative.
 
-2.  **Rotation buffer.** The strategy only rotates to a new top cluster if it outperforms the current cluster by more than `ROTATION_BUFFER` (2 standard deviations of the rank-1 vs rank-2 spread distribution observed over the training period, approximately 0.148%). A spread below this threshold is statistically indistinguishable from noise; one above it reflects a meaningfully strong momentum divergence.
+2.  **Rotation buffer.** The strategy only rotates to a new top cluster if it outperforms the current cluster by more than the rotation buffer.
 
-3.  **ETF weighting within the top cluster.** ETFs are ranked by `rolling_avg_return`. Weight is assigned by inverse rank, normalised to sum to 1, across ETFs with strictly positive rolling average return. ETFs with non-positive returns receive zero weight. If all ETFs in the top cluster have non-positive returns the portfolio moves fully to cash for that period — a natural consequence of the weighting rule, documented here as an explicit assumption: *the strategy moves to cash when no ETF in the selected cluster shows positive momentum.*
+3.  **ETF weighting within the top cluster.** ETFs are ranked by `rolling_avg_return`. Weight is assigned by inverse rank, normalised to sum to 1. ETFs with non-positive returns receive zero weight. If all ETFs in the top cluster have non-positive returns the portfolio moves fully to cash for that period.
 
 ```{r}
 
@@ -1360,8 +1353,6 @@ compute_signal <- function(rebal_date, prev_cluster, cluster_assign, data, buffe
 }
 
 ```
-
-## Simulation
 
 ```{r}
 #| cache: true
@@ -1452,7 +1443,7 @@ trade_log       <- bind_rows(trade_rows)
 
 ```
 
-## Equity Curve
+## Back-Test Results
 
 ```{r}
 
@@ -1537,3 +1528,199 @@ trade_log %>%
   )
 
 ```
+
+# Section 6 — Evaluation
+
+```{r}
+#| cache: true
+
+library(PerformanceAnalytics)
+
+# Risk-free rate: 3-month T-bill (^IRX) averaged over test period
+# ^IRX is annualised yield in percent — convert to daily decimal
+irx <- tq_get("^IRX", get = "stock.prices",
+               from = "2025-01-01", to = "2026-03-31")
+rf_daily <- irx %>%
+  summarise(rf = mean(adjusted, na.rm = TRUE) / 100 / 252) %>%
+  pull(rf)
+
+```
+
+```{r}
+
+# Convert strategy and SPY daily returns to xts — required by PerformanceAnalytics
+strat_xts <- xts(portfolio_daily$daily_return, order.by = portfolio_daily$date)
+
+spy_ret <- algo_df %>%
+  filter(symbol == "SPY",
+         date >= as.Date("2025-01-01"),
+         date <= as.Date("2026-03-31")) %>%
+  arrange(date) %>%
+  drop_na(cc_return)
+
+spy_xts <- xts(spy_ret$cc_return, order.by = spy_ret$date)
+
+```
+
+## Return Distribution
+
+```{r}
+
+# Histogram of strategy daily returns over test period
+# Vertical line at zero; mean return annotated on chart
+mean_ret <- mean(portfolio_daily$daily_return, na.rm = TRUE)
+
+plot_ly(
+  x    = portfolio_daily$daily_return * 100,
+  type = "histogram",
+  nbinsx = 40,
+  marker = list(color = col_navy, line = list(color = "white", width = 0.4))
+) %>%
+  add_segments(
+    x = 0, xend = 0, y = 0, yend = 30,
+    line = list(color = "#E45756", width = 2, dash = "dash"),
+    showlegend = FALSE
+  ) %>%
+  add_segments(
+    x = mean_ret * 100, xend = mean_ret * 100, y = 0, yend = 30,
+    line = list(color = col_slate, width = 2, dash = "dot"),
+    showlegend = FALSE
+  ) %>%
+  add_annotations(
+    x = mean_ret * 100, y = 31,
+    text = paste0("Mean = ", round(mean_ret * 100, 3), "%"),
+    showarrow = FALSE,
+    font = list(color = col_slate, size = 12)
+  ) %>%
+  layout(
+    title  = list(text = "Strategy Daily Return Distribution (Test Period)",
+                  font = list(size = 15, color = col_navy)),
+    xaxis  = list(title = "Daily Return (%)"),
+    yaxis  = list(title = "Count"),
+    bargap = 0.05,
+    paper_bgcolor = "white",
+    plot_bgcolor  = "#F5F7FA"
+  )
+
+```
+
+## Performance Metrics
+
+```{r}
+
+# Compute annualised return, Sharpe, and Omega for strategy and SPY
+# rf_daily used as threshold for both Sharpe and Omega (directly comparable)
+metrics <- tibble(
+  Metric   = c("Annualised Return", "Sharpe Ratio", "Omega Ratio"),
+  Strategy = c(
+    as.numeric(Return.annualized(strat_xts, scale = 252)),
+    as.numeric(SharpeRatio.annualized(strat_xts, Rf = rf_daily, scale = 252)),
+    as.numeric(Omega(strat_xts, L = rf_daily))
+  ),
+  SPY      = c(
+    as.numeric(Return.annualized(spy_xts, scale = 252)),
+    as.numeric(SharpeRatio.annualized(spy_xts, Rf = rf_daily, scale = 252)),
+    as.numeric(Omega(spy_xts, L = rf_daily))
+  )
+) %>%
+  mutate(
+    Strategy = case_when(
+      Metric == "Annualised Return" ~ paste0(round(Strategy * 100, 2), "%"),
+      TRUE                         ~ as.character(round(Strategy, 3))
+    ),
+    SPY = case_when(
+      Metric == "Annualised Return" ~ paste0(round(as.numeric(SPY) * 100, 2), "%"),
+      TRUE                         ~ as.character(round(as.numeric(SPY), 3))
+    )
+  )
+
+metrics %>%
+  gt() %>%
+  cols_label(Metric = "", Strategy = "Strategy", SPY = "SPY Buy & Hold") %>%
+  tab_style(
+    style     = list(cell_text(weight = "bold", color = col_navy)),
+    locations = cells_body(columns = Metric)
+  ) %>%
+  tab_style(
+    style     = list(cell_fill(color = col_navy), cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = col_band),
+    locations = cells_body(rows = c(1, 3))
+  ) %>%
+  tab_options(
+    table.border.top.color            = col_navy,
+    table.border.bottom.color         = col_navy,
+    column_labels.border.bottom.color = col_navy,
+    table.font.size                   = 14,
+    data_row.padding                  = px(8)
+  )
+
+```
+
+Overall the strategy performed consistently over the test period and reliably picked up momentum signal even during minor market corrections.
+
+The strategy performed poorly in a serious market crash (April 1 Liberation Day), seriously impacting its Sharpe Ratio.
+
+## Max Drawdown
+
+```{r}
+
+# Rolling drawdown series for strategy and SPY over test period
+strat_dd <- as.data.frame(Drawdowns(strat_xts)) %>%
+  rownames_to_column("date") %>%
+  mutate(date = as.Date(date)) %>%
+  rename(strategy_dd = 2)
+
+spy_dd <- as.data.frame(Drawdowns(spy_xts)) %>%
+  rownames_to_column("date") %>%
+  mutate(date = as.Date(date)) %>%
+  rename(spy_dd = 2)
+
+dd_df <- left_join(strat_dd, spy_dd, by = "date")
+
+plot_ly(dd_df, x = ~date) %>%
+  add_lines(
+    y    = ~strategy_dd * 100,
+    name = "Strategy",
+    line = list(color = col_navy, width = 2)
+  ) %>%
+  add_lines(
+    y    = ~spy_dd * 100,
+    name = "SPY Buy & Hold",
+    line = list(color = col_slate, width = 2, dash = "dash")
+  ) %>%
+  layout(
+    title  = list(text = "Drawdown — Strategy vs SPY (Test Period)",
+                  font = list(size = 15, color = col_navy)),
+    xaxis  = list(title = "Date"),
+    yaxis  = list(title = "Drawdown (%)", ticksuffix = "%"),
+    legend = list(orientation = "h", y = -0.15),
+    paper_bgcolor = "white",
+    plot_bgcolor  = "#F5F7FA"
+  )
+
+```
+
+# Section 7 — Reflections
+
+1.  I didn't have strong quantitative backing for my **lookback period.** Results of the correlation analysis were hardly significant, so I fell back on research.
+
+2.  The number of K-means relative to the number of ETF's available may have resulted in reduced diversification in the trading strategy. Specifically when prices fell in early April, the portfolio was 100% invested in a single ETF.
+
+    -    I should have applied rules to clusters containing a low \# of positive return ETF's
+
+    -   Implement diversification and perhaps score conviction within cluster allocations.
+
+3.  Kalman filtering parameters on PCA 2 loadings were fixed.
+
+    R = 0.1 & Q = 0.001
+
+    This smoothed out the loadings heavily.
+
+    -   This is defensible, but directly impacts the cluster groupings in my algorithm. Across the entire model, I was left making decisions on how tightly to tune my parameters. Its a game of balancing how reactive your signal is. Ultimately I chose to be more conservative.
+
+4.  I am not sure momentum by itself is a strategy I can rely on solely. While momentum fascinates me, and I believe securities in the stock market exhibit momentum-based signals, I also believe stock markets are highly sensitive to sentiment. If I were to make this model more robust - I would include a market-level sentiment indicator to determine how much cash to have on hand.
+
+5.  Long-only is both intuitive and less volatile than long-short strategies. I prefer it, and that reflects heavily on my own trading tendencies, and also is consistent with the conservative parameters I chose for this strategy.

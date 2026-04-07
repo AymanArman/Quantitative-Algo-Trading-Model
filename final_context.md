@@ -235,15 +235,30 @@ Output: full trade log + daily `portfolio_value` series over test period.
 ---
 
 ### Section 8 — Evaluation
-Analyse and evaluate strategy results against SPY benchmark.
-- Metrics: annualised return, annualised Sharpe (risk-free rate TBD), max drawdown, Calmar ratio
-- Turnover: average monthly portfolio turnover; flag if materially high
-- Benchmark: SPY buy-and-hold over same test period
-- Evaluate test period only for strategy performance; training period used for methodology validation
-- Equity curve plot, drawdown plot, turnover chart
-- Discuss results honestly — what worked, what didn't, what assumptions matter most
+Analyse and evaluate strategy results against SPY benchmark. Test period only (Jan 2025 – Mar 2026). Annualisation convention: 252 trading days throughout.
 
-*Refine before execution:* risk-free rate assumption, annualisation convention.
+**8.1 — Setup**
+- Pull 3-month T-bill yield (^IRX) via `tq_get` over the test period; average adjusted yield → `rf_daily = mean_yield / 100 / 252`
+- Pull SPY daily returns over test period from `algo_df` (cc_return, symbol == "SPY")
+- Convert strategy and SPY daily returns to `xts` — required by PerformanceAnalytics
+- Load `PerformanceAnalytics`
+
+**8.2 — Return Distribution**
+- Plotly histogram of strategy daily returns over test period
+- Displayed near the top of Section 8 — gives immediate intuition before metrics
+- Vertical line at 0; annotate mean return on chart
+
+**8.3 — Summary Metrics Table**
+- Compute via PerformanceAnalytics using strategy and SPY xts objects:
+  - Annualised return: `Return.annualized()`
+  - Sharpe: `SharpeRatio.annualized()` with `Rf = rf_daily`
+  - Omega: `Omega()` with `L = rf_daily` (threshold matches Sharpe for comparability)
+- Display as gt summary card: one row per metric, two columns (Strategy vs SPY)
+
+**8.4 — Max Drawdown Chart**
+- Compute rolling drawdown series for strategy and SPY: `Drawdowns()` from PerformanceAnalytics
+- Plotly line chart over test period — both series on same axes
+- Shaded area or line below zero; x-axis is date, y-axis is drawdown (%)
 
 ---
 

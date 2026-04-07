@@ -22,3 +22,24 @@ No parameter fitting on the test set — all model fitting, lookback selection, 
 
 **Why:** User explicitly corrected this when the plan said lookback would be computed on the full date range.
 **How to apply:** Any rolling window calibration, elbow method, or signal threshold selection must use train_df only.
+
+---
+
+Use `nrow(.)` inside gt() tab_style() chains causes errors — gt does not resolve the pipe placeholder in that context.
+
+**Why:** Caused a render failure in the XLK validation table.
+**How to apply:** Always compute row counts as a named variable before the gt() chain and reference that variable inside cells_body().
+
+---
+
+plotly `scatter3d` animations require `redraw = TRUE` in `animation_opts()` — `redraw = FALSE` causes frames not to update.
+
+**Why:** 3D cluster chart was static despite animation slider being present.
+**How to apply:** Always use `redraw = TRUE` for scatter3d; `redraw = FALSE` is fine for 2D charts.
+
+---
+
+plotly animation frame labels must sort chronologically — use `format(date, "%Y-%m")` not `format(date, "%b %Y")`.
+
+**Why:** "%b %Y" sorts alphabetically (Apr before Jan), scrambling the date slider order.
+**How to apply:** Always use "%Y-%m" as the frame variable for plotly animations. Display-friendly labels can go in hover text instead.

@@ -129,47 +129,107 @@ Add the four clustering features to `algo_df` (long format), then pivot to wide 
 ---
 
 ### Section 5 — Clustering
-Assign each ETF to a cluster for each day over the training dataset.
-- tidymodels workflow: `recipe` (scale features) + `k_means` spec
-- Elbow method: fit K = 2 through 8, select K at elbow of within-cluster SS; K ≥ 3 required
-- Assign cluster ID per ETF per day
-- Validate: XLK should consistently fall in the cyclical cluster
-- Output column: `cluster_id`
+Dynamic monthly clustering: re-fit k-means at each rebalancing date using current feature values. ETFs shift clusters over time as their character changes — this is the core of the regime-aware strategy.
 
-*Refine before execution:* cluster label stability across time.
+**Feature scaling:**
+- Features (pc2_filtered, rel_strength, beta, hit_rate) are on very different scales — beta ~1, hit_rate ~0–1, pc2_filtered and rel_strength in small decimals
+- K-means is distance-based so unscaled features let whichever feature has the largest variance dominate
+- tidymodels recipe with `step_normalize()` applied before each monthly fit
+
+**K selection — elbow method (training data only):**
+- Fit K = 2 through 8 on training data; plot WCSS vs K as a line chart with points
+- Select K at the elbow; K ≥ 3 required per strategy design
+- K locked once and applied to all monthly fits
+
+**Dynamic clustering:**
+- At each rebalancing date (first trading day of each month), fit k-means on that date's feature values across all ETFs with complete features
+- Output: `cluster_id` per ETF per rebalancing date
+- XLK validation: table showing XLK's cluster assignment over time — confirms it consistently falls in the cluster with the highest pc2_filtered (cyclical group)
+
+**Note — cluster label consistency is intentionally not addressed:**
+- K-means randomly renumbers clusters each run (cluster 1 this month ≠ cluster 1 next month)
+- This is irrelevant to the strategy: at each rebalancing date we identify the top cluster by its rolling average return, not by its label
+- We never track a named cluster over time — we only ask "which cluster is performing best right now?" and allocate to it
+- Attempting to align labels across runs would add complexity with no strategic benefit
+
+**Visualisation:**
+- Elbow chart: WCSS vs K, line + points, project color scheme
+- 3D animated scatter (monthly frames): x = rel_strength, y = beta, z = hit_rate; color = cluster_id; one point per ETF per frame — shows ETFs moving through feature space and cluster assignments shifting over time
+
+**Output:** `cluster_id` column added to `model_df` for each rebalancing date; feeds directly into Section 7 signal logic
 
 ---
 
 ### Section 6 — Portfolio Infrastructure
 Build the execution and accounting framework before applying any signal.
-- Define execution convention: open-open, close-open, or open-close (resolve here with rationale)
-- Per-ETF columns: `weight`, `value`, `trade_value`, `quantity`
-- Portfolio-level columns: `portfolio_value`, `daily_return`
-- Rebalance sequence (from strat_brainstorm.md):
-  1. Mark holdings to closing price → current portfolio value
-  2. Compute new target weights
-  3. New weights × portfolio value → target values
-  4. Subtract current values → trade_value per ETF
-  5. Divide by price → quantity to buy/sell
-- Starting capital: TBD during phase refinement
-- Assume full execution at rebalance price, zero market impact, zero transaction costs (explicit assumption)
-- Output: portfolio accounting table ready to receive signals
 
-*Refine before execution:* starting capital, handling of first rebalance, return convention criteria.
+**Starting capital:** $1,000,000
+
+**Execution convention — Option 1 (split rebalance day):**
+- Rebalance occurs on the first trading day of each month (day T); signal computed from data through T-1 close
+- On rebalance day T, two P&L events are accounted for separately:
+  - Gap: `old_weights × co_return_T` (T-1 close → T open, on old positions)
+  - Intraday: `new_weights × oc_return_T` (T open → T close, on new positions)
+  - Intermediate `pv_open` computed as transient variable; not stored as a column
+- Non-rebalance days: `weights × cc_return` (close-to-close)
+- `portfolio_value` column always represents end-of-day (close) value — single column, no split needed
+
+**First rebalance:**
+- Deploy $1,000,000 on first trading day of Jan 2025
+- Signal computed using last 63 days of training data (Oct–Dec 2024) as the lookback window
+- No warm-up period consumed from the test set — training data provides it
+- Model fitting boundary unchanged: June 2000 – Dec 2024
+
+**Rebalance sequence:**
+  1. Compute `pv_open = pv_yesterday_close × (1 + sum(old_weights × co_return_T))`
+  2. Compute new target weights from signal (Section 7)
+  3. `new_weights × pv_open` → target values per ETF
+  4. Subtract current values → `trade_value` per ETF
+  5. Divide by open price → `quantity` to buy/sell
+  6. `pv_close = pv_open × (1 + sum(new_weights × oc_return_T))`
+
+**Assumptions (state explicitly in document):**
+- Full execution at open price on rebalance day; zero market impact; zero transaction costs
+- Cash positions earn 0% — no risk-free rate applied
+
+**Per-ETF columns:** `weight`, `value`, `trade_value`, `quantity`
+**Portfolio-level columns:** `portfolio_value` (end-of-day close), `daily_return`
+
+Output: portfolio accounting table ready to receive signals.
 
 ---
 
 ### Section 7 — Signal Rules + Simulation
 Apply momentum signal logic and simulate the strategy over the test set.
-- Cluster ranking: equal-weighted rolling average return per cluster; top cluster selected
-- Rotation buffer: only rotate if new top cluster outperforms current by > X% (X resolved empirically)
-- ETF ranking within top cluster: by rolling average return
-- Weight assignment: inverse rank normalised to 1; zero weight for negative-return ETFs
-- Signal: `signal ∈ {0, 1}` per ETF per rebalance
-- Simulate monthly rebalancing from Jan 2025 – Mar 2026 using infrastructure from Section 6
-- Output: full trade log + daily portfolio value series over test period
 
-*Refine before execution:* rotation buffer threshold, handling of ties in ranking, edge case where all ETFs in top cluster have negative returns.
+**Cluster ranking:**
+- Equal-weighted rolling average `cc_return` over `lookback_days = 63` per cluster
+- Top cluster = highest average return (can be negative — see edge case below)
+
+**Rotation buffer:**
+- Only rotate to a new top cluster if it outperforms the current cluster by > 0.5% (tentative; noted in document)
+- On first rebalance (no prior cluster): no buffer applied
+
+**ETF ranking within top cluster:**
+- Rank constituent ETFs by rolling average `cc_return` over `lookback_days`
+- Ties broken by symbol alphabetically (arbitrary, consistent)
+
+**Weight assignment:**
+- Inverse rank weighting: `weight_i = (1 / rank_i) / sum(1 / rank_j)` for positive-return ETFs only
+- ETFs with non-positive rolling average return receive `weight = 0`
+- Weights renormalised to sum to 1 across positive-return ETFs
+
+**All-negative edge case (Option A — implicit cash):**
+- If all ETFs in the top cluster have non-positive rolling average return, all weights = 0
+- Portfolio holds 100% cash for that period; earns 0%
+- This is a natural consequence of the weighting rule — no separate mechanism needed
+- Document explicitly: *"Strategy moves to cash when no ETF in the top cluster shows positive momentum"*
+
+**Signal:** `signal ∈ {0, 1}` per ETF per rebalance date
+
+**Simulation:** Monthly rebalancing Jan 2025 – Mar 2026 using infrastructure from Section 6
+
+Output: full trade log + daily `portfolio_value` series over test period.
 
 ---
 

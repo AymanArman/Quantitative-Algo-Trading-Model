@@ -1,0 +1,626 @@
+---
+title: "QT_Model_Ayman"
+format: 
+  html:
+    embed-resources: true
+editor: visual
+---
+
+```{r, include = FALSE}
+
+knitr::opts_chunk$set(warning = FALSE,
+                      message = FALSE,
+                      echo    = FALSE)
+
+```
+
+```{r, message = FALSE}
+
+library(tidyverse)
+library(tidyquant)
+
+```
+
+# Section 1 — Data
+
+```{r}
+
+# Pull daily OHLCV for all sector ETFs, SPY (benchmark), and XLG (performance tracker)
+# Training: 2000-06-01 – 2024-12-31 | Test: 2025-01-01 – 2026-03-31
+# Note: XLC (2018), XLG (2005), XLRE (2015) have shorter histories — handled via dynamic universe
+df <- tidyquant::tq_get(
+  c("SPY", "XLB", "XLC", "XLE", "XLF", "XLG", "XLI", "XLK", "XLP", "XLRE", "XLV", "XLU", "XLY"),
+  get  = "stock.prices",
+  from = "2000-06-01",
+  to   = "2026-03-31"
+)
+
+```
+
+## Data Coverage
+
+```{r}
+
+# Confirm date range and observation count per ticker
+df %>%
+  group_by(symbol) %>%
+  summarise(
+    first_date = min(date),
+    last_date  = max(date),
+    n_obs      = n(),
+    .groups    = "drop"
+  ) %>%
+  arrange(first_date)
+
+```
+
+## Data Quality — NA / NaN / NULL
+
+```{r}
+
+# NA count per column per symbol
+# NaN in R is a special case of NA for numeric columns — is.na() catches both
+na_summary <- df %>%
+  group_by(symbol) %>%
+  summarise(across(everything(), ~sum(is.na(.))), .groups = "drop")
+
+na_summary
+
+```
+
+```{r}
+
+# Flag any rows where price columns are zero or negative — indicates data corruption
+df %>%
+  filter(open <= 0 | high <= 0 | low <= 0 | close <= 0 | adjusted <= 0) %>%
+  nrow() %>%
+  {cat("Rows with zero or negative prices:", ., "\n")}
+
+```
+
+```{r}
+
+# Check for missing trading dates: any date where some symbols have data but others don't
+# A clean dataset should have the same set of dates for all symbols active at that point
+date_coverage <- df %>%
+  group_by(date) %>%
+  summarise(n_symbols = n_distinct(symbol), .groups = "drop")
+
+cat("Expected symbols per date (full universe):", n_distinct(df$symbol), "\n")
+cat("Dates with fewer symbols than expected:", sum(date_coverage$n_symbols < n_distinct(df$symbol)), "\n")
+
+```
+
+## Return Computation
+
+```{r}
+
+# Yahoo Finance only provides adjusted close, not adjusted open.
+# Derive adjusted open using the daily adjustment ratio: adj_open = open * (adjusted / close)
+# This applies the same split/dividend scaling to open prices for consistency.
+#
+# Return conventions (all log returns — additive across time, standard for PCA and analysis):
+#   cc_return: close-to-close (primary return for all analysis, PCA, and feature computation)
+#   oo_return: open-to-open (adjusted)
+#   co_return: overnight gap — today's adj open vs yesterday's adj close
+#   oc_return: intraday — today's adj close vs today's adj open
+#
+# Execution convention for portfolio simulation (Section 6) is tentative — determined by
+# execution logic. Arithmetic returns will be derived from whichever convention is chosen.
+df <- df %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(
+    adj_open  = open * (adjusted / close),
+    cc_return = log(adjusted / lag(adjusted)),
+    oo_return = log(adj_open  / lag(adj_open)),
+    co_return = log(adj_open  / lag(adjusted)),
+    oc_return = log(adjusted  / adj_open)
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+
+# Sanity check — quantiles across all return conventions to catch data corruption or outliers
+df %>%
+  filter(!is.na(cc_return)) %>%
+  select(symbol, cc_return, oo_return, co_return, oc_return) %>%
+  pivot_longer(-symbol, names_to = "convention", values_to = "return") %>%
+  group_by(convention) %>%
+  summarise(
+    min    = round(min(return,                 na.rm = TRUE), 4),
+    q01    = round(quantile(return, 0.01,      na.rm = TRUE), 4),
+    median = round(median(return,              na.rm = TRUE), 4),
+    q99    = round(quantile(return, 0.99,      na.rm = TRUE), 4),
+    max    = round(max(return,                 na.rm = TRUE), 4),
+    .groups = "drop"
+  )
+
+```
+
+## Price History
+
+```{r, fig.width = 10, fig.height = 6}
+
+# Adjusted closing price over full history — confirms data loaded correctly
+# SPY and XLG shown separately as benchmarks
+df %>%
+  mutate(role = case_when(
+    symbol %in% c("SPY", "XLG") ~ "Benchmark",
+    TRUE                        ~ "Sector ETF"
+  )) %>%
+  ggplot(aes(x = date, y = adjusted, colour = symbol)) +
+  geom_line(linewidth = 0.4) +
+  facet_wrap(~role, scales = "free_y") +
+  labs(
+    title  = "Adjusted Closing Prices — Full History",
+    x      = NULL,
+    y      = "Adjusted Close ($)",
+    colour = NULL
+  ) +
+  theme_minimal()
+
+```
+
+# Section 2 — Algo Dataset Construction
+
+```{r}
+
+# Build the canonical algo dataset from df
+# Selects only columns needed for signal computation and portfolio simulation
+# SPY and XLG are retained — excluded from clustering/features in later sections, not here
+# Rolling return columns (over lookback_days) added after Section 3 locks the parameter
+#
+# Columns:
+#   date, symbol  — identity
+#   open          — adjusted open  (adj_open: split/dividend-scaled for consistency with close)
+#   close         — adjusted close (Yahoo's adjusted field)
+#   cc_return     — log close-to-close (primary return: PCA, features, signal computation)
+#   oo_return     — log open-to-open (adjusted)
+#   co_return     — log overnight gap (adj open today vs adj close yesterday)
+#   oc_return     — log intraday (adj close vs adj open today)
+algo_df <- df %>%
+  select(date, symbol,
+         open  = adj_open,
+         close = adjusted,
+         cc_return, oo_return, co_return, oc_return)
+
+glimpse(algo_df)
+
+# Split into training and test sets — defined once here, referenced throughout
+# Training: 2000-06-01 – 2024-12-31 (model fitting, PCA, clustering, feature calibration)
+# Test:     2025-01-01 – 2026-03-31 (signal simulation and evaluation only — no parameter fitting)
+train_df <- algo_df %>% filter(date <= as.Date("2024-12-31"))
+test_df  <- algo_df %>% filter(date >= as.Date("2025-01-01") & date <= as.Date("2026-03-31"))
+
+```
+
+# Section 3 — Lookback Period Selection
+
+```{r, message = FALSE}
+
+library(gt)
+
+```
+
+```{r}
+
+# Fixed holding period — monthly rebalancing throughout
+# Candidates: 1, 3, 6, 12 months expressed in trading days
+H            <- 21L
+L_candidates <- c(21L, 63L, 126L, 252L)
+
+# Project color palette — shared across all gt tables in this document
+col_navy        <- "#1B2A4A"
+col_slate       <- "#4A6FA5"
+col_light_slate <- "#D6E4F0"
+col_band        <- "#F5F7FA"
+
+```
+
+```{r}
+
+# For one ETF and one L candidate:
+#   1. Build two-column table (signal, forward_return) with non-overlapping holding periods
+#   2. Signal:  mean cc_return over past L days at each step point
+#   3. Forward: sum cc_return over next H days at each step point
+#   4. Stride = H because all L >= H (Chan 2013 — non-overlapping holding periods)
+#   5. Run cor.test and return one summary row
+#
+# Example: compute_lookback_cor("XLK", 63L, 21L, train_df)
+compute_lookback_cor <- function(sym, L, H, data) {
+
+  returns <- data %>%
+    filter(symbol == sym) %>%
+    arrange(date) %>%
+    pull(cc_return)
+
+  # Drop leading NA (first obs per symbol has no lag)
+  returns <- returns[!is.na(returns)]
+  n       <- length(returns)
+
+  # Step points: i has L days behind it and H days ahead
+  step_pts <- seq(from = L + 1, to = n - H + 1, by = H)
+  if (length(step_pts) < 10) return(NULL)
+
+  signal  <- map_dbl(step_pts, ~ mean(returns[(.x - L):(.x - 1)]))
+  forward <- map_dbl(step_pts, ~ sum(returns[.x:(.x + H - 1)]))
+
+  ct <- cor.test(signal, forward, method = "pearson")
+
+  tibble(
+    symbol  = sym,
+    L       = L,
+    H       = H,
+    n_obs   = length(step_pts),
+    r       = round(as.numeric(ct$estimate), 4),
+    r_sq    = round(as.numeric(ct$estimate)^2, 4),
+    p_value = round(ct$p.value, 4)
+  )
+}
+
+```
+
+```{r}
+
+# Run across all symbols x all L candidates — one row per ETF x L in output
+symbols_universe <- unique(train_df$symbol)
+
+lookback_results <- map_dfr(symbols_universe, function(sym) {
+  map_dfr(L_candidates, function(L) {
+    compute_lookback_cor(sym, L, H, train_df)
+  })
+})
+
+```
+
+```{r}
+
+# Aggregate to one row per L: median r, median r_sq, and proportion of ETFs with p < 0.05
+lookback_summary <- lookback_results %>%
+  group_by(L, H) %>%
+  summarise(
+    avg_n_obs       = round(mean(n_obs)),
+    median_r        = round(median(r), 3),
+    median_r_sq     = round(median(r_sq), 3),
+    pct_significant = mean(p_value < 0.05),
+    .groups         = "drop"
+  ) %>%
+  arrange(L)
+
+# Selection: highest median_r among candidates where majority of ETFs are significant
+# Prefer shorter L on ties
+selected_L <- lookback_summary %>%
+  filter(pct_significant >= 0.5) %>%
+  arrange(desc(median_r), L) %>%
+  slice(1) %>%
+  pull(L)
+
+# Fallback: if no candidate clears the threshold, pick highest pct_significant
+if (length(selected_L) == 0) {
+  selected_L <- lookback_summary %>%
+    arrange(desc(pct_significant), desc(median_r)) %>%
+    slice(1) %>%
+    pull(L)
+  warning("No lookback candidate cleared the 50% significance threshold — selected by highest pct_significant.")
+}
+
+lookback_days <- selected_L
+cat("Selected lookback_days:", lookback_days, "\n")
+
+```
+
+```{r}
+
+# Diagnostic table — one row per L candidate
+# Significant rows (majority of ETFs p < 0.05) highlighted in slate-blue
+# Selected row bolded
+lookback_summary %>%
+  mutate(selected = if_else(L == lookback_days, "Yes", "")) %>%
+  gt() %>%
+  tab_header(
+    title    = "Lookback Period Selection",
+    subtitle = "Non-overlapping correlation: lookback signal vs 21-day forward return | Training data only"
+  ) %>%
+  cols_label(
+    L               = "Lookback (days)",
+    H               = "Holding (days)",
+    avg_n_obs       = "Avg Samples",
+    median_r        = "Median r",
+    median_r_sq     = "Median r²",
+    pct_significant = "% ETFs Significant",
+    selected        = "Selected"
+  ) %>%
+  fmt_percent(columns = pct_significant, decimals = 0) %>%
+  fmt_number(columns = c(median_r, median_r_sq), decimals = 3) %>%
+  # Dark navy header
+  tab_style(
+    style     = list(cell_fill(color = col_navy), cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) %>%
+  # Alternating row bands
+  tab_style(
+    style     = cell_fill(color = col_band),
+    locations = cells_body(rows = c(1, 3))
+  ) %>%
+  # Highlight selected row
+  tab_style(
+    style     = list(cell_fill(color = col_light_slate), cell_text(weight = "bold")),
+    locations = cells_body(rows = selected == "Yes")
+  ) %>%
+  # Title color
+  tab_style(
+    style     = cell_text(color = col_navy, weight = "bold", size = "large"),
+    locations = cells_title(groups = "title")
+  ) %>%
+  tab_style(
+    style     = cell_text(color = col_slate, size = "small"),
+    locations = cells_title(groups = "subtitle")
+  ) %>%
+  tab_options(
+    table.border.top.color            = col_navy,
+    table.border.bottom.color         = col_navy,
+    column_labels.border.bottom.color = col_navy,
+    table.font.size                   = 14,
+    data_row.padding                  = px(6)
+  )
+
+```
+
+```{r}
+
+# Detail table — one row per ETF x L, ordered by L then symbol
+# Significant rows (p < 0.05) highlighted in slate-blue
+# Fixed height showing ~6-7 rows; remainder scrollable
+lookback_results %>%
+  arrange(L, symbol) %>%
+  mutate(significant = p_value < 0.05) %>%
+  gt() %>%
+  tab_header(
+    title    = "Lookback Correlation — Full Detail",
+    subtitle = "One row per ETF × lookback candidate | Training data only"
+  ) %>%
+  cols_label(
+    symbol      = "ETF",
+    L           = "Lookback (days)",
+    H           = "Holding (days)",
+    n_obs       = "Samples",
+    r           = "r",
+    r_sq        = "r²",
+    p_value     = "p-value",
+    significant = "p < 0.05"
+  ) %>%
+  fmt_number(columns = c(r, r_sq, p_value), decimals = 3) %>%
+  cols_hide(significant) %>%
+  # Navy header
+  tab_style(
+    style     = list(cell_fill(color = col_navy), cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) %>%
+  # Highlight significant rows
+  tab_style(
+    style     = cell_fill(color = col_light_slate),
+    locations = cells_body(rows = significant == TRUE)
+  ) %>%
+  # Title styling
+  tab_style(
+    style     = cell_text(color = col_navy, weight = "bold", size = "large"),
+    locations = cells_title(groups = "title")
+  ) %>%
+  tab_style(
+    style     = cell_text(color = col_slate, size = "small"),
+    locations = cells_title(groups = "subtitle")
+  ) %>%
+  tab_options(
+    table.border.top.color            = col_navy,
+    table.border.bottom.color         = col_navy,
+    column_labels.border.bottom.color = col_navy,
+    table.font.size                   = 14,
+    data_row.padding                  = px(6),
+    container.height                  = px(220),
+    container.overflow.y              = "auto"
+  )
+
+```
+
+```{r}
+
+# Pull SPY returns as a named vector (date → cc_return) for fast lookup
+spy_returns <- train_df %>%
+  filter(symbol == "SPY") %>%
+  arrange(date) %>%
+  select(date, spy_return = cc_return)
+
+# Relative return version: signal and forward both use ETF cc_return minus SPY cc_return
+# Same non-overlapping stride logic as absolute version (stride = H, all L >= H)
+# SPY excluded — cannot compute relative return for SPY vs itself
+#
+# Example: compute_rel_cor("XLK", 63L, 21L, train_df, spy_returns)
+compute_rel_cor <- function(sym, L, H, data, spy_ret) {
+
+  etf <- data %>%
+    filter(symbol == sym) %>%
+    arrange(date) %>%
+    select(date, cc_return)
+
+  # Join SPY return by date and compute excess return
+  joined <- etf %>%
+    inner_join(spy_ret, by = "date") %>%
+    mutate(excess = cc_return - spy_return)
+
+  returns <- joined %>% pull(excess)
+  returns <- returns[!is.na(returns)]
+  n       <- length(returns)
+
+  step_pts <- seq(from = L + 1, to = n - H + 1, by = H)
+  if (length(step_pts) < 10) return(NULL)
+
+  signal  <- map_dbl(step_pts, ~ mean(returns[(.x - L):(.x - 1)]))
+  forward <- map_dbl(step_pts, ~ sum(returns[.x:(.x + H - 1)]))
+
+  ct <- cor.test(signal, forward, method = "pearson")
+
+  tibble(
+    symbol  = sym,
+    L       = L,
+    H       = H,
+    n_obs   = length(step_pts),
+    r       = round(as.numeric(ct$estimate), 4),
+    r_sq    = round(as.numeric(ct$estimate)^2, 4),
+    p_value = round(ct$p.value, 4)
+  )
+}
+
+```
+
+```{r}
+
+# Run across all symbols except SPY (XLG included as diagnostic)
+symbols_rel <- symbols_universe[symbols_universe != "SPY"]
+
+lookback_results_rel <- map_dfr(symbols_rel, function(sym) {
+  map_dfr(L_candidates, function(L) {
+    compute_rel_cor(sym, L, H, train_df, spy_returns)
+  })
+})
+
+```
+
+```{r}
+
+# Aggregate and select lookback_days from relative return analysis
+lookback_summary_rel <- lookback_results_rel %>%
+  group_by(L, H) %>%
+  summarise(
+    avg_n_obs       = round(mean(n_obs)),
+    median_r        = round(median(r), 3),
+    median_r_sq     = round(median(r_sq), 3),
+    pct_significant = mean(p_value < 0.05),
+    .groups         = "drop"
+  ) %>%
+  arrange(L)
+
+selected_L_rel <- lookback_summary_rel %>%
+  filter(pct_significant >= 0.5) %>%
+  arrange(desc(median_r), L) %>%
+  slice(1) %>%
+  pull(L)
+
+if (length(selected_L_rel) == 0) {
+  selected_L_rel <- lookback_summary_rel %>%
+    arrange(desc(pct_significant), desc(median_r)) %>%
+    slice(1) %>%
+    pull(L)
+  warning("No relative-return candidate cleared the 50% threshold — selected by highest pct_significant.")
+}
+
+# Lock lookback_days from relative return analysis (primary selection basis)
+lookback_days <- selected_L_rel
+cat("Selected lookback_days (relative return):", lookback_days, "\n")
+
+```
+
+```{r}
+
+# Summary table — relative return vs SPY
+lookback_summary_rel %>%
+  mutate(selected = if_else(L == lookback_days, "Yes", "")) %>%
+  gt() %>%
+  tab_header(
+    title    = "Lookback Period Selection — Relative Return vs SPY",
+    subtitle = "Non-overlapping correlation: excess return signal vs 21-day forward excess return | Training data only"
+  ) %>%
+  cols_label(
+    L               = "Lookback (days)",
+    H               = "Holding (days)",
+    avg_n_obs       = "Avg Samples",
+    median_r        = "Median r",
+    median_r_sq     = "Median r²",
+    pct_significant = "% ETFs Significant",
+    selected        = "Selected"
+  ) %>%
+  fmt_percent(columns = pct_significant, decimals = 0) %>%
+  fmt_number(columns = c(median_r, median_r_sq), decimals = 3) %>%
+  tab_style(
+    style     = list(cell_fill(color = col_navy), cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = col_band),
+    locations = cells_body(rows = c(1, 3))
+  ) %>%
+  tab_style(
+    style     = list(cell_fill(color = col_light_slate), cell_text(weight = "bold")),
+    locations = cells_body(rows = selected == "Yes")
+  ) %>%
+  tab_style(
+    style     = cell_text(color = col_navy, weight = "bold", size = "large"),
+    locations = cells_title(groups = "title")
+  ) %>%
+  tab_style(
+    style     = cell_text(color = col_slate, size = "small"),
+    locations = cells_title(groups = "subtitle")
+  ) %>%
+  tab_options(
+    table.border.top.color            = col_navy,
+    table.border.bottom.color         = col_navy,
+    column_labels.border.bottom.color = col_navy,
+    table.font.size                   = 14,
+    data_row.padding                  = px(6)
+  )
+
+```
+
+```{r}
+
+# Detail table — relative return, one row per ETF x L, ordered by L then symbol
+# Fixed height showing ~6-7 rows; remainder scrollable
+lookback_results_rel %>%
+  arrange(L, symbol) %>%
+  mutate(significant = p_value < 0.05) %>%
+  gt() %>%
+  tab_header(
+    title    = "Lookback Correlation (Relative) — Full Detail",
+    subtitle = "One row per ETF × lookback candidate | Excess return vs SPY | Training data only"
+  ) %>%
+  cols_label(
+    symbol      = "ETF",
+    L           = "Lookback (days)",
+    H           = "Holding (days)",
+    n_obs       = "Samples",
+    r           = "r",
+    r_sq        = "r²",
+    p_value     = "p-value",
+    significant = "p < 0.05"
+  ) %>%
+  fmt_number(columns = c(r, r_sq, p_value), decimals = 3) %>%
+  cols_hide(significant) %>%
+  tab_style(
+    style     = list(cell_fill(color = col_navy), cell_text(color = "white", weight = "bold")),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = col_light_slate),
+    locations = cells_body(rows = significant == TRUE)
+  ) %>%
+  tab_style(
+    style     = cell_text(color = col_navy, weight = "bold", size = "large"),
+    locations = cells_title(groups = "title")
+  ) %>%
+  tab_style(
+    style     = cell_text(color = col_slate, size = "small"),
+    locations = cells_title(groups = "subtitle")
+  ) %>%
+  tab_options(
+    table.border.top.color            = col_navy,
+    table.border.bottom.color         = col_navy,
+    column_labels.border.bottom.color = col_navy,
+    table.font.size                   = 14,
+    data_row.padding                  = px(6),
+    container.height                  = px(220),
+    container.overflow.y              = "auto"
+  )
+
+```

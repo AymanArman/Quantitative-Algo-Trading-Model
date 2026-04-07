@@ -31,7 +31,22 @@ Clustering-based S&P 500 sector trading model in R, submitted as .qmd + self-con
 4. Within top cluster: long only, inverse rank weighting among positive-return ETFs, normalised to sum to 1
 5. Monthly rebalancing; daily data and signal computation
 
-**Status:** Brainstorming complete. Ready for planning.
+**Status:** Section 2 (Algo Dataset Construction) complete. Next: Section 3 refinement + execution (2026-04-07 morning).
+
+**Section 1 decisions locked:**
+- `adj_open = open * (adjusted / close)` — derived adjusted open for consistency with Yahoo's adjusted close
+- Four log return columns computed: `cc_return` (close-close, primary for analysis/PCA), `oo_return`, `co_return`, `oc_return`
+- SPY and XLG are benchmark/comparison only — not clustered, not traded
+- Data confirmed clean: no zero/negative prices; 4540 dates with <13 symbols (expected, driven by XLC/XLG/XLRE shorter histories)
+- `df` is the master dataframe
+
+**Section 2 decisions locked:**
+- `algo_df` is the canonical algo dataset — all subsequent sections add columns to it
+- Columns: `date, symbol, open (= adj_open), close (= adjusted), cc_return, oo_return, co_return, oc_return`
+- Both price columns are adjusted — raw open/close dropped
+- `train_df`: `date <= 2024-12-31` | `test_df`: `2025-01-01 <= date <= 2026-03-31`
+- No parameter fitting on test set — lookback selection (Section 3) and all model fitting use training data only
+- planning.md Section 3 updated to reflect training-only lookback selection
 
 **Why:** Course assignment with strict reproducibility and workflow requirements.
 **How to apply:** All code decisions must respect tidymodels, API-only data, and R-only constraints. Strategy decisions are locked in strat_brainstorm.md — read that file for full rationale before planning.

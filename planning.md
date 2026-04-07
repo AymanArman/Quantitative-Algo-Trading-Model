@@ -35,53 +35,96 @@ Pull daily OHLCV for all 12 sector ETFs (XLB, XLC, XLE, XLF, XLG, XLI, XLK, XLP,
 
 ---
 
-### Section 2 — Lookback Period Selection
-Empirically select a single universal lookback period for rolling returns.
-- Test: 21, 63, 126, 252 trading days (≈ 1, 3, 6, 12 months)
-- Method: correlate rolling average return at each lookback to next-period return; assess p-value
-- Run on SPY, then equal-weighted sector ETF average
-- Handle XLC/XLRE shorter histories separately; verify result holds on full universe from 2019
-- Selection rule: shortest lookback with largest significant correlation; document any SPY vs sector conflict
-- Output: single locked integer `lookback_days` used for all downstream computation
+### Section 2 — Algo Dataset Construction
+Build the base dataset that all features and signals attach to.
+- This is the canonical table — every subsequent section adds columns to it
+- Initial columns: `{date, ticker, open, close, oo_return, co_return, oc_return}`
+- Rolling returns over `lookback_days` added after Section 3 locks the parameter
+- Covers full date range; SPY and XLG included for benchmark columns but not for feature/cluster columns
 
-*Refine before execution:* exact correlation/predictiveness methodology, conflict resolution rule.
+*Refine before execution:* confirm return definitions (arithmetic vs log), alignment with rebalance dates.
 
 ---
 
-### Section 3 — Algo Dataset Construction
-Build the base dataset that all features and signals attach to.
-- Compute rolling returns per ETF over `lookback_days`
-- This is the canonical table — every subsequent section adds columns to it
-- Output: `{date, ticker, rolling_return}` indexed by trading day over training period
+### Section 3 — Lookback Period Selection
+Empirically select a single universal lookback period for rolling returns.
+- Computed in a **separate diagnostic table**, draws from Section 2 `cc_return`
+- Run on **training data only** (June 2000 – Dec 2024) — no parameter fitting on test set; all ETFs including SPY and XLG
+- Candidates: L = 21, 63, 126, 252 trading days (≈ 1, 3, 6, 12 months); holding period H = 21 days fixed
 
-*Refine before execution:* confirm rolling return definition (arithmetic vs log), alignment with rebalance dates.
+**Correlation methodology (Chan 2013 non-overlapping rule):**
+- All candidates have L ≥ H, so stride = H = 21 days (non-overlapping holding periods)
+- Index sequence per ETF × L: `seq(from = L + 1, to = nrow - H, by = H)`
+- At each step point `i`: signal = `mean(cc_return[(i-L):(i-1)])`; forward = `sum(cc_return[i:(i+H-1)])`
+- This produces a two-column intermediate table (signal, forward_return) — one row per step point
+- Run `cor.test()` on those two columns → extract `r` and `p_value`
+- Approximate sample counts: L=21→~291, L=63→~281, L=126→~278, L=252→~271
+
+**Analysis 1 — Absolute return correlation (retained):**
+- Signal: `mean(cc_return[(i-L):(i-1)])`; forward: `sum(cc_return[i:(i+H-1)])`
+- Output table (one row per ETF × L): `symbol, L, H, n_obs, r, r_sq, p_value`
+- Aggregation table (one row per L): median r, median r², % ETFs significant
+- Note: absolute lookback returns are still used downstream as clustering features (Section 4) — this analysis is diagnostic, not the primary selection basis
+
+**Analysis 2 — Relative return vs SPY (primary selection basis):**
+- Same methodology and stride logic as Analysis 1
+- Signal: `mean((ETF_cc_return - SPY_cc_return)[(i-L):(i-1)])`; forward: `sum((ETF_cc_return - SPY_cc_return)[i:(i+H-1)])`
+- SPY excluded from its own relative return test; XLG excluded from clustering but included here as diagnostic
+- Rationale: strategy ranks clusters by relative outperformance vs market — relative return correlation directly validates the signal used for selection
+- Same output tables as Analysis 1
+
+**Selection rule (applied to Analysis 2):** shortest L where median r is maximised and majority of ETFs significant; document any conflicts with Analysis 1
+
+**Presentation:** both analyses rendered as gt tables (summary + detail) using project standard color scheme
+
+**Output:** single locked integer `lookback_days` used for all downstream algo dataset computation
 
 ---
 
 ### Section 4 — Feature Engineering
-Add the four clustering features to the algo dataset.
+Add the four clustering features to `algo_df` (long format), then pivot to wide `model_df` at the end.
+
+**Dataframe strategy:**
+- `algo_df` (long) — master dataset; all feature engineering done here via `group_by(symbol)`
+- `model_df` (wide) — created once at the end of Section 4 by pivoting; one row per date, each ETF's features as columns; input for clustering (Section 5) and portfolio simulation (Sections 6–7)
 
 **4a — PCA → PC2 → Cyclical/Defensive Label**
-- Rolling PCA on sector return covariance matrix over `lookback_days`
-- Extract PC2 loadings per ETF per day
-- Sign-align: XLK loading on PC2 forced positive; flip all loadings if needed
-- Apply Kalman Filter to raw PC2 loadings (per ETF independently) to smooth estimation noise
-- Derive qualitative label: positive filtered loading = cyclical, negative = defensive
-- Output column: `pc2_filtered`, `cluster_character` (cyclical/defensive)
+
+*Rolling PCA (daily, not static):*
+- ETF universe: 11 tradeable sector ETFs only — SPY and XLG excluded; XLC and XLRE excluded until they have a full `lookback_days` window of history
+- Function `compute_rolling_pc2(algo_df, lookback_days)`:
+  - Internally pivots long → wide (date × ETF columns of cc_return) for matrix operations
+  - At each date t: extract trailing `lookback_days` rows → compute covariance matrix → eigen decomposition → extract PC2 loadings per ETF
+  - Sign-align: XLK loading on PC2 forced positive; flip all loadings on that date if needed
+  - Returns long df: `date, symbol, pc2_raw`
+- Snapshot verification displayed after this step: eigenvector matrix for one representative date (ETFs as rows, PCs as columns) to confirm cyclical/defensive split
+
+*Kalman Filter (separate function, run after PCA):*
+- Function `apply_kalman_pc2(pc2_raw_df)`:
+  - 1D local level model per ETF independently: true state evolves slowly, raw PC2 loading is noisy observation
+  - Locked parameters: Q = 0.001 (process noise), R = 0.1 (observation noise)
+  - Returns long df: `date, symbol, pc2_raw, pc2_filtered`
+- Output columns added to `algo_df`: `pc2_raw`, `pc2_filtered`, `cluster_character` (cyclical if pc2_filtered > 0, defensive otherwise)
 
 **4b — Relative Strength vs SPY**
 - Rolling average return of ETF minus rolling average return of SPY over `lookback_days`
-- Output column: `rel_strength`
+- Computed in long format via `group_by(symbol)`
+- Output column added to `algo_df`: `rel_strength`
 
 **4c — Beta to SPY**
 - Rolling OLS slope of ETF daily returns on SPY daily returns over `lookback_days`
-- Output column: `beta`
+- Computed in long format via `group_by(symbol)`
+- Output column added to `algo_df`: `beta`
 
 **4d — Momentum Consistency (Hit Rate)**
 - Proportion of positive return days over `lookback_days`
-- Output column: `hit_rate`
+- Computed in long format via `group_by(symbol)`
+- Output column added to `algo_df`: `hit_rate`
 
-*Refine before execution:* Kalman Filter state model definition (Q, R initialisation), rolling PCA implementation, feature scaling approach.
+**End of Section 4 — pivot to wide:**
+- `model_df <- algo_df %>% pivot_wider(...)` — one row per date, columns: `date, {ETF}_pc2_filtered, {ETF}_cluster_character, {ETF}_rel_strength, {ETF}_beta, {ETF}_hit_rate`
+- SPY and XLG excluded from `model_df`
+- `algo_df` retained as-is for reference
 
 ---
 
@@ -169,7 +212,7 @@ Strictly sequential. Each section must produce clean, validated output before th
 ## Deferred Design Decisions (resolve during execution)
 
 - API source for data (Section 1)
-- Exact lookback period — output of Section 2
+- Exact lookback period — output of Section 3
 - Kalman Filter Q and R values (Section 4)
 - K is fixed globally — selected once via elbow method on training data (Section 5)
 - Starting capital (Section 6)
